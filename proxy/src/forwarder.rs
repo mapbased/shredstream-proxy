@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -17,7 +16,6 @@ use jito_protos::shredstream::{Entry as PbEntry, TraceShred};
 use log::{debug, error, info, warn};
 use prost::Message;
 use solana_client::client_error::reqwest;
-use solana_ledger::shred::ReedSolomonCache;
 use solana_metrics::{datapoint_info, datapoint_warn};
 use solana_net_utils::SocketConfig;
 use solana_perf::{
@@ -25,18 +23,13 @@ use solana_perf::{
     packet::{PacketBatch, PacketBatchRecycler},
     recycler::Recycler,
 };
-use solana_sdk::clock::Slot;
 use solana_streamer::{
     sendmmsg::{batch_send, SendPktsError},
     streamer::{self, StreamerReceiveStats},
 };
 use tokio::sync::broadcast::Sender;
 
-use crate::{
-    deshred,
-    deshred::{ComparableShred, ShredsStateTracker},
-    resolve_hostname_port, ShredstreamProxyError,
-};
+use crate::{deshred, resolve_hostname_port, ShredstreamProxyError};
 
 // values copied from https://github.com/solana-labs/solana/blob/33bde55bbdde13003acf45bb6afe6db4ab599ae4/core/src/sigverify_shreds.rs#L20
 pub const DEDUPER_FALSE_POSITIVE_RATE: f64 = 0.001;
@@ -87,31 +80,13 @@ pub fn start_forwarder_threads(
         let hdl = std::thread::Builder::new()
             .name("shred_reconstructor".to_string())
             .spawn(move || {
-                let mut all_shreds = ahash::HashMap::<
-                    Slot,
-                    (
-                        ahash::HashMap<u32, HashSet<ComparableShred>>,
-                        ShredsStateTracker,
-                    ),
-                >::default();
-                let mut slot_fec_indexes_to_iterate = Vec::<(Slot, u32)>::new();
-                let mut deshredded_entries =
-                    Vec::<(Slot, Vec<solana_entry::entry::Entry>, Vec<u8>)>::new();
-                let mut highest_slot_seen: Slot = 0;
-                let rs_cache = ReedSolomonCache::default();
+                let mut shred_processor = deshred::ShredProcessor::new(metrics.clone());
 
                 while !exit.load(Ordering::Relaxed) {
                     match reconstruct_rx.recv_timeout(Duration::from_millis(100)) {
                         Ok(pkt_batch) => {
-                            deshred::reconstruct_shreds(
-                                pkt_batch,
-                                &mut all_shreds,
-                                &mut slot_fec_indexes_to_iterate,
-                                &mut deshredded_entries,
-                                &mut highest_slot_seen,
-                                &rs_cache,
-                                &metrics,
-                            );
+                            let mut deshredded_entries =
+                                shred_processor.process_packets(&pkt_batch);
 
                             deshredded_entries.drain(..).for_each(
                                 |(slot, _entries, entries_bytes)| {
