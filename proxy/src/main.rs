@@ -89,7 +89,7 @@ struct CommonArgs {
     src_bind_addr: IpAddr,
 
     /// Port where Shredstream proxy listens. Use `0` for random ephemeral port.
-    #[arg(long, env, default_value_t = 20_000)]
+    #[arg(long, env, default_value_t = 4739)]
     src_bind_port: u16,
 
     /// Multicast IP to listen for shreds. If none provided, attempts to
@@ -133,8 +133,8 @@ struct CommonArgs {
     debug_trace_shred: bool,
 
     /// GRPC port for serving decoded shreds as Solana entries
-    #[arg(long, env)]
-    grpc_service_port: Option<u16>,
+    #[arg(long, env,default_value_t = 9_999)]
+    grpc_service_port: u16,
 
     /// Public IP address to use.
     /// Overrides value fetched from `ifconfig.me`.
@@ -227,17 +227,6 @@ fn main() -> Result<(), ShredstreamProxyError> {
         ProxySubcommands::ForwardOnly(x) => x,
     };
     set_host_id(hostname::get()?.into_string().unwrap());
-    if (args.endpoint_discovery_url.is_none() && args.discovered_endpoints_port.is_some())
-        || (args.endpoint_discovery_url.is_some() && args.discovered_endpoints_port.is_none())
-    {
-        return Err(ShredstreamProxyError::IoError(io::Error::new(ErrorKind::InvalidInput, "Invalid arguments provided, dynamic endpoints requires both --endpoint-discovery-url and --discovered-endpoints-port.")));
-    }
-    if args.endpoint_discovery_url.is_none()
-        && args.discovered_endpoints_port.is_none()
-        && args.dest_ip_ports.is_empty()
-    {
-        return Err(ShredstreamProxyError::IoError(io::Error::new(ErrorKind::InvalidInput, "No destinations found. You must provide values for --dest-ip-ports or --endpoint-discovery-url.")));
-    }
 
     let exit = Arc::new(AtomicBool::new(false));
     let (shutdown_sender, shutdown_receiver) =
@@ -255,28 +244,12 @@ fn main() -> Result<(), ShredstreamProxyError> {
         }));
     }
 
-    let metrics = Arc::new(ShredMetrics::new(args.grpc_service_port.is_some()));
+    let metrics = Arc::new(ShredMetrics::new(true));
 
-    let runtime = Runtime::new()?;
+
     let mut thread_handles = vec![];
-    if let ProxySubcommands::Shredstream(args) = shredstream_args {
-        if args.desired_regions.len() > 2 {
-            warn!(
-                "Too many regions requested, only regions: {:?} will be used",
-                &args.desired_regions[..2]
-            );
-        }
-        let heartbeat_hdl =
-            start_heartbeat(args, &exit, &shutdown_receiver, runtime, metrics.clone());
-        thread_handles.push(heartbeat_hdl);
-    }
-
-    // share sockets between refresh and forwarder thread
-    let unioned_dest_sockets = Arc::new(ArcSwap::from_pointee(
-        args.dest_ip_ports
-            .iter()
-            .map(|x| x.0)
-            .collect::<Vec<SocketAddr>>(),
+     let unioned_dest_sockets = Arc::new(ArcSwap::from_pointee(
+         vec![],
     ));
 
     // share deduper + metrics between forwarder <-> accessory thread
@@ -288,14 +261,14 @@ fn main() -> Result<(), ShredstreamProxyError> {
 
     let entry_sender = Arc::new(BroadcastSender::new(100));
     let forward_stats = Arc::new(StreamerReceiveStats::new("shredstream_proxy-listen_thread"));
-    let use_discovery_service =
-        args.endpoint_discovery_url.is_some() && args.discovered_endpoints_port.is_some();
-    let maybe_multicast_socket = create_multicast_socket_on_device(
-        &args.multicast_device,
-        args.multicast_subscribe_port,
-        args.multicast_bind_ip,
-    )
-    .inspect(|mcast_socket| info!("Multicast listeners found: {mcast_socket:?}."));
+
+    let maybe_multicast_socket =None;
+    // = create_multicast_socket_on_device(
+    //     &args.multicast_device,
+    //     args.multicast_subscribe_port,
+    //     args.multicast_bind_ip,
+    // )
+    // .inspect(|mcast_socket| info!("Multicast listeners found: {mcast_socket:?}."));
     let forwarder_hdls = forwarder::start_forwarder_threads(
         unioned_dest_sockets.clone(),
         args.src_bind_addr,
@@ -303,10 +276,10 @@ fn main() -> Result<(), ShredstreamProxyError> {
         maybe_multicast_socket,
         args.num_threads,
         deduper.clone(),
-        args.grpc_service_port.is_some(),
+        true,
         entry_sender.clone(),
         args.debug_trace_shred,
-        use_discovery_service,
+        false,
         forward_stats.clone(),
         metrics.clone(),
         shutdown_receiver.clone(),
@@ -318,7 +291,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
         let exit = exit.clone();
         spawn(move || {
             while !exit.load(Ordering::Relaxed) {
-                sleep(Duration::from_secs(1));
+                sleep(Duration::from_secs(2));
                 forward_stats.report();
             }
         })
@@ -333,27 +306,17 @@ fn main() -> Result<(), ShredstreamProxyError> {
         exit.clone(),
     );
     thread_handles.push(metrics_hdl);
-    if use_discovery_service {
-        let refresh_handle = forwarder::start_destination_refresh_thread(
-            args.endpoint_discovery_url.unwrap(),
-            args.discovered_endpoints_port.unwrap(),
-            args.dest_ip_ports,
-            unioned_dest_sockets,
-            shutdown_receiver.clone(),
-            exit.clone(),
-        );
-        thread_handles.push(refresh_handle);
-    }
 
-    if let Some(port) = args.grpc_service_port {
+
+
         let server_hdl = server::start_server_thread(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED),  args.grpc_service_port ),
             entry_sender.clone(),
             exit.clone(),
             shutdown_receiver.clone(),
         );
         thread_handles.push(server_hdl);
-    }
+
 
     info!(
         "Shredstream started, listening on {}:{}/udp.",
