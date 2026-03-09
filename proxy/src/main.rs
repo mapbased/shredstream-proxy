@@ -227,17 +227,17 @@ fn main() -> Result<(), ShredstreamProxyError> {
         ProxySubcommands::ForwardOnly(x) => x,
     };
     set_host_id(hostname::get()?.into_string().unwrap());
-    if (args.endpoint_discovery_url.is_none() && args.discovered_endpoints_port.is_some())
-        || (args.endpoint_discovery_url.is_some() && args.discovered_endpoints_port.is_none())
-    {
-        return Err(ShredstreamProxyError::IoError(io::Error::new(ErrorKind::InvalidInput, "Invalid arguments provided, dynamic endpoints requires both --endpoint-discovery-url and --discovered-endpoints-port.")));
-    }
-    if args.endpoint_discovery_url.is_none()
-        && args.discovered_endpoints_port.is_none()
-        && args.dest_ip_ports.is_empty()
-    {
-        return Err(ShredstreamProxyError::IoError(io::Error::new(ErrorKind::InvalidInput, "No destinations found. You must provide values for --dest-ip-ports or --endpoint-discovery-url.")));
-    }
+    // if (args.endpoint_discovery_url.is_none() && args.discovered_endpoints_port.is_some())
+    //     || (args.endpoint_discovery_url.is_some() && args.discovered_endpoints_port.is_none())
+    // {
+    //     return Err(ShredstreamProxyError::IoError(io::Error::new(ErrorKind::InvalidInput, "Invalid arguments provided, dynamic endpoints requires both --endpoint-discovery-url and --discovered-endpoints-port.")));
+    // }
+    // if args.endpoint_discovery_url.is_none()
+    //     && args.discovered_endpoints_port.is_none()
+    //     && args.dest_ip_ports.is_empty()
+    // {
+    //     return Err(ShredstreamProxyError::IoError(io::Error::new(ErrorKind::InvalidInput, "No destinations found. You must provide values for --dest-ip-ports or --endpoint-discovery-url.")));
+    // }
 
     let exit = Arc::new(AtomicBool::new(false));
     let (shutdown_sender, shutdown_receiver) =
@@ -258,7 +258,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
     let metrics = Arc::new(ShredMetrics::new(args.grpc_service_port.is_some()));
 
     let runtime = Runtime::new()?;
-    let mut thread_handles = vec![];
+   // let mut thread_handles = vec![];
     if let ProxySubcommands::Shredstream(args) = shredstream_args {
         if args.desired_regions.len() > 2 {
             warn!(
@@ -266,113 +266,116 @@ fn main() -> Result<(), ShredstreamProxyError> {
                 &args.desired_regions[..2]
             );
         }
+        info!("ip :{:?} port:{:?}",args.common_args.public_ip,args.common_args.src_bind_port);
         let heartbeat_hdl =
             start_heartbeat(args, &exit, &shutdown_receiver, runtime, metrics.clone());
-        thread_handles.push(heartbeat_hdl);
+        heartbeat_hdl.join();
     }
+    println!("check in put!");
 
-    // share sockets between refresh and forwarder thread
-    let unioned_dest_sockets = Arc::new(ArcSwap::from_pointee(
-        args.dest_ip_ports
-            .iter()
-            .map(|x| x.0)
-            .collect::<Vec<SocketAddr>>(),
-    ));
-
-    // share deduper + metrics between forwarder <-> accessory thread
-    // use mutex since metrics are write heavy. cheaper than rwlock
-    let deduper = Arc::new(RwLock::new(Deduper::<2, [u8]>::new(
-        &mut rand::thread_rng(),
-        forwarder::DEDUPER_NUM_BITS,
-    )));
-
-    let entry_sender = Arc::new(BroadcastSender::new(100));
-    let forward_stats = Arc::new(StreamerReceiveStats::new("shredstream_proxy-listen_thread"));
-    let use_discovery_service =
-        args.endpoint_discovery_url.is_some() && args.discovered_endpoints_port.is_some();
-    let maybe_multicast_socket = create_multicast_socket_on_device(
-        &args.multicast_device,
-        args.multicast_subscribe_port,
-        args.multicast_bind_ip,
-    )
-    .inspect(|mcast_socket| info!("Multicast listeners found: {mcast_socket:?}."));
-    let forwarder_hdls = forwarder::start_forwarder_threads(
-        unioned_dest_sockets.clone(),
-        args.src_bind_addr,
-        args.src_bind_port,
-        maybe_multicast_socket,
-        args.num_threads,
-        deduper.clone(),
-        args.grpc_service_port.is_some(),
-        entry_sender.clone(),
-        args.debug_trace_shred,
-        use_discovery_service,
-        forward_stats.clone(),
-        metrics.clone(),
-        shutdown_receiver.clone(),
-        exit.clone(),
-    );
-    thread_handles.extend(forwarder_hdls);
-
-    let report_metrics_thread = {
-        let exit = exit.clone();
-        spawn(move || {
-            while !exit.load(Ordering::Relaxed) {
-                sleep(Duration::from_secs(1));
-                forward_stats.report();
-            }
-        })
-    };
-    thread_handles.push(report_metrics_thread);
-
-    let metrics_hdl = forwarder::start_forwarder_accessory_thread(
-        deduper,
-        metrics.clone(),
-        args.metrics_report_interval_ms,
-        shutdown_receiver.clone(),
-        exit.clone(),
-    );
-    thread_handles.push(metrics_hdl);
-    if use_discovery_service {
-        let refresh_handle = forwarder::start_destination_refresh_thread(
-            args.endpoint_discovery_url.unwrap(),
-            args.discovered_endpoints_port.unwrap(),
-            args.dest_ip_ports,
-            unioned_dest_sockets,
-            shutdown_receiver.clone(),
-            exit.clone(),
-        );
-        thread_handles.push(refresh_handle);
-    }
-
-    if let Some(port) = args.grpc_service_port {
-        let server_hdl = server::start_server_thread(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
-            entry_sender.clone(),
-            exit.clone(),
-            shutdown_receiver.clone(),
-        );
-        thread_handles.push(server_hdl);
-    }
-
-    info!(
-        "Shredstream started, listening on {}:{}/udp.",
-        args.src_bind_addr, args.src_bind_port
-    );
-
-    for thread in thread_handles {
-        thread.join().expect("thread panicked");
-    }
-
-    info!(
-        "Exiting Shredstream, {} received , {} sent successfully, {} failed, {} duplicate shreds.",
-        metrics.agg_received_cumulative.load(Ordering::Relaxed),
-        metrics
-            .agg_success_forward_cumulative
-            .load(Ordering::Relaxed),
-        metrics.agg_fail_forward_cumulative.load(Ordering::Relaxed),
-        metrics.duplicate_cumulative.load(Ordering::Relaxed),
-    );
+    //
+    // // share sockets between refresh and forwarder thread
+    // let unioned_dest_sockets = Arc::new(ArcSwap::from_pointee(
+    //     args.dest_ip_ports
+    //         .iter()
+    //         .map(|x| x.0)
+    //         .collect::<Vec<SocketAddr>>(),
+    // ));
+    //
+    // // share deduper + metrics between forwarder <-> accessory thread
+    // // use mutex since metrics are write heavy. cheaper than rwlock
+    // let deduper = Arc::new(RwLock::new(Deduper::<2, [u8]>::new(
+    //     &mut rand::thread_rng(),
+    //     forwarder::DEDUPER_NUM_BITS,
+    // )));
+    //
+    // let entry_sender = Arc::new(BroadcastSender::new(100));
+    // let forward_stats = Arc::new(StreamerReceiveStats::new("shredstream_proxy-listen_thread"));
+    // let use_discovery_service =
+    //     args.endpoint_discovery_url.is_some() && args.discovered_endpoints_port.is_some();
+    // let maybe_multicast_socket = create_multicast_socket_on_device(
+    //     &args.multicast_device,
+    //     args.multicast_subscribe_port,
+    //     args.multicast_bind_ip,
+    // )
+    // .inspect(|mcast_socket| info!("Multicast listeners found: {mcast_socket:?}."));
+    // let forwarder_hdls = forwarder::start_forwarder_threads(
+    //     unioned_dest_sockets.clone(),
+    //     args.src_bind_addr,
+    //     args.src_bind_port,
+    //     maybe_multicast_socket,
+    //     args.num_threads,
+    //     deduper.clone(),
+    //     args.grpc_service_port.is_some(),
+    //     entry_sender.clone(),
+    //     args.debug_trace_shred,
+    //     use_discovery_service,
+    //     forward_stats.clone(),
+    //     metrics.clone(),
+    //     shutdown_receiver.clone(),
+    //     exit.clone(),
+    // );
+    // thread_handles.extend(forwarder_hdls);
+    //
+    // let report_metrics_thread = {
+    //     let exit = exit.clone();
+    //     spawn(move || {
+    //         while !exit.load(Ordering::Relaxed) {
+    //             sleep(Duration::from_secs(1));
+    //             forward_stats.report();
+    //         }
+    //     })
+    // };
+    // thread_handles.push(report_metrics_thread);
+    //
+    // let metrics_hdl = forwarder::start_forwarder_accessory_thread(
+    //     deduper,
+    //     metrics.clone(),
+    //     args.metrics_report_interval_ms,
+    //     shutdown_receiver.clone(),
+    //     exit.clone(),
+    // );
+    // thread_handles.push(metrics_hdl);
+    // if use_discovery_service {
+    //     let refresh_handle = forwarder::start_destination_refresh_thread(
+    //         args.endpoint_discovery_url.unwrap(),
+    //         args.discovered_endpoints_port.unwrap(),
+    //         args.dest_ip_ports,
+    //         unioned_dest_sockets,
+    //         shutdown_receiver.clone(),
+    //         exit.clone(),
+    //     );
+    //     thread_handles.push(refresh_handle);
+    // }
+    //
+    // if let Some(port) = args.grpc_service_port {
+    //     let server_hdl = server::start_server_thread(
+    //         SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+    //         entry_sender.clone(),
+    //         exit.clone(),
+    //         shutdown_receiver.clone(),
+    //     );
+    //     thread_handles.push(server_hdl);
+    // }
+    //
+    // info!(
+    //     "Shredstream started, listening on {}:{}/udp.",
+    //     args.src_bind_addr, args.src_bind_port
+    // );
+    //
+    // for thread in thread_handles {
+    //     thread.join().expect("thread panicked");
+    // }
+    //
+    // info!(
+    //     "Exiting Shredstream, {} received , {} sent successfully, {} failed, {} duplicate shreds.",
+    //     metrics.agg_received_cumulative.load(Ordering::Relaxed),
+    //     metrics
+    //         .agg_success_forward_cumulative
+    //         .load(Ordering::Relaxed),
+    //     metrics.agg_fail_forward_cumulative.load(Ordering::Relaxed),
+    //     metrics.duplicate_cumulative.load(Ordering::Relaxed),
+    // );
     Ok(())
 }
 
