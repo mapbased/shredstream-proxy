@@ -292,7 +292,7 @@ pub fn reconstruct_shreds(
                 .iter_mut()
                 .for_each(|(_slot, fec_set_indexes)| fec_set_indexes.sort_unstable());
             datapoint_warn!(
-                "shredstream_proxy-deshred_missed_fec_sets",
+                "localshred_lite_proxy-deshred_missed_fec_sets",
                 (
                     "slot_fec_set_indexes",
                     format!("{:?}", incomplete_fec_sets.iter().sorted().collect_vec()),
@@ -632,6 +632,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires bins/serialized_shreds.bin from upstream git-lfs"]
     fn test_reconstruct_live_shreds() {
         let packets = {
             let mut file = std::fs::File::open("../bins/serialized_shreds.bin").unwrap();
@@ -807,6 +808,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires bins/serialized_shreds_data_complete_test.bin from upstream git-lfs"]
     /// Test if DATA_COMPLETE_SHRED across multiple FEC sets is handled correctly
     fn test_reconstruct_live_data_complete_shred() {
         let packets = {

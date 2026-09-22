@@ -9,59 +9,39 @@ use std::{
 };
 
 use crossbeam_channel::Receiver;
-use jito_protos::{
-    auth::{auth_service_client::AuthServiceClient, Role},
-    shredstream::{shredstream_client::ShredstreamClient, Heartbeat},
-};
-use log::{info, warn};
+use jito_protos::shredstream::{shredstream_client::ShredstreamClient, Heartbeat};
+use log::{error, info, warn};
 use solana_metrics::{datapoint_info, datapoint_warn};
-use solana_sdk::signature::Keypair;
 use tokio::runtime::Runtime;
 use tonic::{codegen::InterceptedService, transport::Channel, Code};
 
 use crate::{
+    api_key_interceptor::{create_grpc_channel, ApiKeyInterceptor},
     forwarder::ShredMetrics,
-    shutdown_has_passed,
-    token_authenticator::{create_grpc_channel, ClientInterceptor},
     ShredstreamProxyError,
 };
-/*
-    This is a wrapper around AtomicBool that allows us to scope the lifetime of the AtomicBool to the heartbeat loop.
-    This is useful because we want to ensure that the AtomicBool is set to true when the heartbeat loop exits.
-*/
-struct ScopedAtomicBool {
-    inner: Arc<AtomicBool>,
-}
 
-impl ScopedAtomicBool {
-    fn get_inner_clone(&self) -> Arc<AtomicBool> {
-        self.inner.clone()
-    }
-}
+const REFUSED_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+const UNAUTH_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 
-impl Default for ScopedAtomicBool {
-    fn default() -> Self {
-        Self {
-            inner: Arc::new(AtomicBool::new(false)),
-        }
-    }
-}
-
-impl Drop for ScopedAtomicBool {
-    fn drop(&mut self) {
-        self.inner.store(true, Ordering::Relaxed);
+fn refusal_retry(code: Code) -> Option<Duration> {
+    match code {
+        Code::ResourceExhausted
+        | Code::PermissionDenied
+        | Code::FailedPrecondition
+        | Code::InvalidArgument => Some(REFUSED_RETRY_INTERVAL),
+        Code::Unauthenticated => Some(UNAUTH_RETRY_INTERVAL),
+        _ => None,
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn heartbeat_loop_thread(
-    block_engine_url: String,
-    auth_url: String,
-    auth_keypair: Arc<Keypair>,
-    desired_regions: Vec<String>,
+    localshred_url: String,
+    api_key_header: String,
+    api_key: String,
     recv_socket: SocketAddr,
     runtime: Runtime,
-    service_name: String,
     metrics: Arc<ShredMetrics>,
     shutdown_receiver: Receiver<()>,
     exit: Arc<AtomicBool>,
@@ -82,33 +62,25 @@ pub fn heartbeat_loop_thread(
         let mut client_restart_count_cumulative = 0u64;
         let mut successful_heartbeat_count_cumulative = 0u64;
         let mut failed_heartbeat_count_cumulative = 0u64;
+        let mut terminal_reported = false;
 
-        'heartbeat_loop: while !exit.load(Ordering::Relaxed) {
-            if shutdown_has_passed() {
-                warn!("ShredStream has been shut down");
-                break;
-            }
-            // We want to scope the grpc shredstream client to the heartbeat loop. This way shredstream client exits when the heartbeat loop exits
-            let per_con_exit = ScopedAtomicBool::default();
+        while !exit.load(Ordering::Relaxed) {
             info!("Starting heartbeat client");
             let shredstream_client_res = runtime.block_on(
                 get_grpc_client(
-                    block_engine_url.clone(),
-                    auth_url.clone(),
-                    auth_keypair.clone(),
-                    service_name.clone(),
-                    per_con_exit.get_inner_clone(),
+                    localshred_url.clone(),
+                    api_key_header.clone(),
+                    api_key.clone(),
                 )
             );
-            // Shredstream client lives here -- so it has the same scope as per_con_exit
-            let (mut shredstream_client , refresh_thread_hdl) = match shredstream_client_res {
+            let mut shredstream_client = match shredstream_client_res {
                 Ok(c) => c,
                 Err(e) => {
                     warn!("Failed to connect to block engine, retrying. Error: {e}");
                     client_restart_count += 1;
                     datapoint_warn!(
-                        "shredstream_proxy-heartbeat_client_error",
-                        "block_engine_url" => block_engine_url,
+                        "localshred_lite_proxy-heartbeat_client_error",
+                        "localshred_url" => localshred_url,
                         ("errors", 1, i64),
                         ("error_str", e.to_string(), String),
                     );
@@ -117,21 +89,21 @@ pub fn heartbeat_loop_thread(
                 }
             };
             while !exit.load(Ordering::Relaxed) {
-                if shutdown_has_passed() {
-                    warn!("ShredStream has been shut down");
-                    break 'heartbeat_loop;
-                }
                 crossbeam_channel::select! {
                     // send heartbeat
                     recv(heartbeat_tick) -> _ => {
                         let heartbeat_result = runtime.block_on(shredstream_client
                             .send_heartbeat(Heartbeat {
                                 socket: Some(heartbeat_socket.clone()),
-                                regions: desired_regions.clone(),
+                                regions: Vec::new(),
                             }));
 
                         match heartbeat_result {
                             Ok(hb) => {
+                                if terminal_reported {
+                                    info!("Heartbeat accepted again, resuming normal interval.");
+                                    terminal_reported = false;
+                                }
                                 // retry sooner in case a heartbeat fails
                                 let new_interval = Duration::from_millis((hb.get_ref().ttl_ms / 3) as u64);
                                 if heartbeat_interval != new_interval {
@@ -142,13 +114,21 @@ pub fn heartbeat_loop_thread(
                                 successful_heartbeat_count += 1;
                             }
                             Err(err) => {
-                                if err.code() == Code::InvalidArgument {
-                                    panic!("Invalid arguments: {err}.");
-                                };
-                                warn!("Error sending heartbeat: {err}");
+                                if let Some(retry) = refusal_retry(err.code()) {
+                                    if !terminal_reported {
+                                        error!("Server refused this destination: {}", err.message());
+                                        terminal_reported = true;
+                                    }
+                                    if heartbeat_interval != retry {
+                                        heartbeat_interval = retry;
+                                        heartbeat_tick = crossbeam_channel::tick(retry);
+                                    }
+                                } else {
+                                    warn!("Error sending heartbeat: {err}");
+                                }
                                 datapoint_warn!(
-                                    "shredstream_proxy-heartbeat_send_error",
-                                    "block_engine_url" => block_engine_url,
+                                    "localshred_lite_proxy-heartbeat_send_error",
+                                    "localshred_url" => localshred_url,
                                     ("errors", 1, i64),
                                     ("error_str", err.to_string(), String),
                                 );
@@ -160,8 +140,8 @@ pub fn heartbeat_loop_thread(
                     // send metrics and handle grpc connection failing
                     recv(metrics_tick) -> _ => {
                         datapoint_info!(
-                            "shredstream_proxy-heartbeat_stats",
-                            "block_engine_url" => block_engine_url,
+                            "localshred_lite_proxy-heartbeat_stats",
+                            "localshred_url" => localshred_url,
                             ("successful_heartbeat_count", successful_heartbeat_count, i64),
                             ("failed_heartbeat_count", failed_heartbeat_count, i64),
                             ("client_restart_count", client_restart_count, i64),
@@ -172,14 +152,14 @@ pub fn heartbeat_loop_thread(
                         // we restart our grpc connection to work around the stale connection
                         // if no shreds received, then restart
                         let new_received_count = metrics.agg_received_cumulative.load(Ordering::Relaxed);
-                        if new_received_count == last_cumulative_received_shred_count {
+                        if new_received_count == last_cumulative_received_shred_count
+                            && !terminal_reported
+                        {
                             warn!("No shreds received recently, restarting heartbeat client.");
                             datapoint_warn!(
-                                "shredstream_proxy-heartbeat_restart_signal",
-                                "block_engine_url" => block_engine_url,
-                                ("desired_regions", format!("{desired_regions:?}"), String),
+                                "localshred_lite_proxy-heartbeat_restart_signal",
+                                "localshred_url" => localshred_url,
                             );
-                            refresh_thread_hdl.abort();
                             break;
                         }
                         last_cumulative_received_shred_count = new_received_count;
@@ -206,28 +186,15 @@ pub fn heartbeat_loop_thread(
 }
 
 pub async fn get_grpc_client(
-    block_engine_url: String,
-    auth_url: String,
-    auth_keypair: Arc<Keypair>,
-    service_name: String,
-    exit: Arc<AtomicBool>,
-) -> Result<
-    (
-        ShredstreamClient<InterceptedService<Channel, ClientInterceptor>>,
-        tokio::task::JoinHandle<()>,
-    ),
-    ShredstreamProxyError,
-> {
-    let auth_channel = create_grpc_channel(auth_url).await?;
-    let searcher_channel = create_grpc_channel(block_engine_url).await?;
-    let (client_interceptor, thread_handle) = ClientInterceptor::new(
-        AuthServiceClient::new(auth_channel),
-        auth_keypair,
-        Role::ShredstreamSubscriber,
-        service_name,
-        exit,
-    )
-    .await?;
-    let searcher_client = ShredstreamClient::with_interceptor(searcher_channel, client_interceptor);
-    Ok((searcher_client, thread_handle))
+    localshred_url: String,
+    api_key_header: String,
+    api_key: String,
+) -> Result<ShredstreamClient<InterceptedService<Channel, ApiKeyInterceptor>>, ShredstreamProxyError>
+{
+    let channel = create_grpc_channel(localshred_url).await?;
+    let api_key_interceptor = ApiKeyInterceptor::new(&api_key_header, &api_key)?;
+    Ok(ShredstreamClient::with_interceptor(
+        channel,
+        api_key_interceptor,
+    ))
 }

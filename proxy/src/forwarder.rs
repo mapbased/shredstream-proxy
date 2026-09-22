@@ -19,7 +19,7 @@ use prost::Message;
 use solana_client::client_error::reqwest;
 use solana_ledger::shred::ReedSolomonCache;
 use solana_metrics::{datapoint_info, datapoint_warn};
-use solana_net_utils::SocketConfig;
+use socket2::{Domain, Protocol, Socket, Type};
 use solana_perf::{
     deduper::Deduper,
     packet::{PacketBatch, PacketBatchRecycler},
@@ -66,15 +66,33 @@ pub fn start_forwarder_threads(
 
     let recycler: PacketBatchRecycler = Recycler::warmed(100, 1024);
 
-    // multi_bind_in_range returns (port, Vec<UdpSocket>)
-    let (_port, sockets) = solana_net_utils::multi_bind_in_range_with_config(
-        src_addr,
-        (src_port, src_port + 1),
-        SocketConfig::default().reuseport(true),
-        num_threads,
-    )
-    .unwrap_or_else(|_| {
-        panic!("Failed to bind listener sockets. Check that port {src_port} is not in use.")
+    fn bind_listeners(
+        addr: IpAddr,
+        port: u16,
+        count: usize,
+    ) -> std::io::Result<Vec<std::net::UdpSocket>> {
+        let domain = match addr {
+            IpAddr::V4(_) => Domain::IPV4,
+            IpAddr::V6(_) => Domain::IPV6,
+        };
+        let bind_addr: SocketAddr = SocketAddr::new(addr, port);
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+            sock.set_reuse_address(true)?;
+            sock.set_reuse_port(true)?;
+            if domain == Domain::IPV6 {
+                sock.set_only_v6(false)?;
+            }
+            sock.set_recv_buffer_size(64 * 1024 * 1024).ok();
+            sock.bind(&bind_addr.into())?;
+            out.push(sock.into());
+        }
+        Ok(out)
+    }
+
+    let sockets = bind_listeners(src_addr, src_port, num_threads).unwrap_or_else(|e| {
+        panic!("Failed to bind listener sockets on {src_addr}:{src_port}: {e}")
     });
 
     let (reconstruct_tx, reconstruct_rx) = crossbeam_channel::bounded(1_024);
@@ -311,7 +329,7 @@ fn recv_from_channel_and_send_multiple_dest(
                     .unwrap_or_default();
 
                 datapoint_info!(
-                    "shredstream_proxy-trace_shred_latency",
+                    "localshred_lite_proxy-trace_shred_latency",
                     "trace_region" => trace_shred.region,
                     ("trace_seq_num", trace_shred.seq_num as i64, i64),
                     ("elapsed_micros", elapsed.as_micros(), i64),
@@ -350,7 +368,7 @@ pub fn start_destination_refresh_thread(
                             }
                             Err(e) => {
                                 warn!("Failed to fetch from discovery service, retrying. Error: {e}");
-                                datapoint_warn!("shredstream_proxy-destination_refresh_error",
+                                datapoint_warn!("localshred_lite_proxy-destination_refresh_error",
                                                 ("prev_unioned_dest_count", socket_count, i64),
                                                 ("errors", 1, i64),
                                                 ("error_str", e.to_string(), String),
@@ -362,7 +380,7 @@ pub fn start_destination_refresh_thread(
                         unioned_dest_sockets.store(Arc::new(new_sockets));
                     }
                     recv(metrics_tick) -> _ => {
-                        datapoint_info!("shredstream_proxy-destination_refresh_stats",
+                        datapoint_info!("localshred_lite_proxy-destination_refresh_stats",
                                         ("destination_count", socket_count, i64),
                         );
                     }
@@ -519,7 +537,7 @@ impl ShredMetrics {
 
     pub fn report(&self) {
         datapoint_info!(
-            "shredstream_proxy-connection_metrics",
+            "localshred_lite_proxy-connection_metrics",
             ("received", self.received.load(Ordering::Relaxed), i64),
             (
                 "success_forward",
@@ -536,7 +554,7 @@ impl ShredMetrics {
 
         if self.enabled_grpc_service {
             datapoint_info!(
-                "shredstream_proxy-service_metrics",
+                "localshred_lite_proxy-service_metrics",
                 (
                     "recovered_count",
                     self.recovered_count.swap(0, Ordering::Relaxed),
@@ -575,7 +593,7 @@ impl ShredMetrics {
 
         self.packets_received
             .retain(|addr, (discarded_packets, not_discarded_packets)| {
-                datapoint_info!("shredstream_proxy-receiver_stats",
+                datapoint_info!("localshred_lite_proxy-receiver_stats",
                     "addr" => addr.to_string(),
                     ("discarded_packets", *discarded_packets, i64),
                     ("not_discarded_packets", *not_discarded_packets, i64),
